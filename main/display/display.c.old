@@ -1,0 +1,407 @@
+#include "display.h"
+#include "hardware_config.h"
+#include "st77916_init.h"
+
+#include "esp_log.h"
+#include "esp_check.h"
+
+#include "driver/gpio.h"
+#include "driver/spi_master.h"
+
+#include "esp_lcd_panel_io.h"
+#include "esp_lcd_panel_vendor.h"
+#include "esp_lcd_panel_ops.h"
+
+#include "lvgl.h"
+#include "esp_timer.h"
+#include "esp_heap_caps.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+static const char *TAG = "display";
+
+/*----------------------------------------------------------
+ * Static variables
+ *---------------------------------------------------------*/
+
+static esp_lcd_panel_io_handle_t lcd_io = NULL;
+static esp_lcd_panel_handle_t lcd_panel = NULL;
+
+static lv_display_t *lvgl_display = NULL;
+
+static void *buf1 = NULL;
+static void *buf2 = NULL;
+
+/*----------------------------------------------------------
+ * Static functions
+ *---------------------------------------------------------*/
+
+static esp_err_t lcd_spi_init(void)
+{
+    spi_bus_config_t buscfg =
+    {
+        .data0_io_num = LCD_PIN_DATA0,
+        .data1_io_num = LCD_PIN_DATA1,
+        .data2_io_num = LCD_PIN_DATA2,
+        .data3_io_num = LCD_PIN_DATA3,
+
+        .sclk_io_num = LCD_PIN_CLK,
+
+        .data4_io_num = -1,
+        .data5_io_num = -1,
+        .data6_io_num = -1,
+        .data7_io_num = -1,
+
+        .max_transfer_sz = LCD_H_RES * 40 * sizeof(uint16_t),
+
+        .flags =
+            SPICOMMON_BUSFLAG_MASTER |
+            SPICOMMON_BUSFLAG_GPIO_PINS,
+    };
+
+    return spi_bus_initialize(
+        LCD_HOST,
+        &buscfg,
+        SPI_DMA_CH_AUTO);
+}
+
+/*----------------------------------------------------------
+ * Public functions
+ *---------------------------------------------------------*/
+
+esp_err_t display_init(void)
+{
+    ESP_LOGI(TAG, "==================================");
+    ESP_LOGI(TAG, "Display initialization");
+    ESP_LOGI(TAG, "==================================");
+static void backlight_init(void)
+{
+    gpio_config_t io =
+    {
+        .mode = GPIO_MODE_OUTPUT,
+        .pin_bit_mask = 1ULL << LCD_PIN_BK_LIGHT,
+    };
+
+    gpio_config(&io);
+
+    gpio_set_level(LCD_PIN_BK_LIGHT, 0);
+}
+    ESP_RETURN_ON_ERROR(
+        lcd_spi_init(),
+        TAG,
+        "Failed to initialize SPI bus");
+
+    ESP_RETURN_ON_ERROR(
+        lcd_io_init(),
+        TAG,
+        "Failed to initialize LCD IO");
+
+    ESP_RETURN_ON_ERROR(
+        st77916_init(),
+        TAG,
+        "Failed to initialize ST77916");
+
+    ESP_RETURN_ON_ERROR(
+        lvgl_init(),
+        TAG,
+        "Failed to initialize LVGL");
+        ESP_RETURN_ON_ERROR(
+    lvgl_tick_init(),
+    TAG,
+    "Failed to start LVGL tick");
+
+    display_clear(0x0000);
+
+    display_set_backlight(100);
+
+    ESP_LOGI(TAG, "Display ready");
+
+    return ESP_OK;
+}
+
+static esp_err_t lcd_io_init(void)
+{
+    esp_lcd_panel_io_spi_config_t io_config =
+    {
+        .cs_gpio_num = LCD_PIN_CS,
+
+        .pclk_hz = LCD_PIXEL_CLOCK_HZ,
+
+        .lcd_cmd_bits = 8,
+        .lcd_param_bits = 8,
+
+        .spi_mode = 0,
+
+        .trans_queue_depth = 10,
+
+        .dc_levels =
+        {
+            .dc_idle_level = 0,
+            .dc_cmd_level = 0,
+            .dc_dummy_level = 0,
+            .dc_data_level = 1,
+        },
+
+        .flags =
+        {
+            .quad_mode = 1,
+        },
+    };
+
+    return esp_lcd_new_panel_io_spi(
+        (esp_lcd_spi_bus_handle_t)LCD_HOST,
+        &io_config,
+        &lcd_io);
+}
+ESP_RETURN_ON_ERROR(
+    st77916_init(),
+    TAG,
+    "Failed to initialize ST77916");
+
+ESP_LOGI(TAG, "LCD initialized");
+static esp_err_t st77916_init(void)
+{
+    esp_err_t ret;
+
+    size_t count = sizeof(st77916_vendor_init_cmds) /
+                   sizeof(st77916_vendor_init_cmds[0]);
+
+    ESP_LOGI(TAG, "Sending %u LCD init commands", (unsigned)count);
+
+    for (size_t i = 0; i < count; i++)
+    {
+        const lcd_init_cmd_t *cmd = &st77916_vendor_init_cmds[i];
+
+        ret = esp_lcd_panel_io_tx_param(
+            lcd_io,
+            cmd->cmd,
+            cmd->data,
+            cmd->data_bytes);
+
+        if (ret != ESP_OK)
+        {
+            ESP_LOGE(TAG,
+                     "LCD init failed at command %u (0x%02X)",
+                     (unsigned)i,
+                     cmd->cmd);
+
+            return ret;
+        }
+
+        if (cmd->delay_ms)
+        {
+            vTaskDelay(pdMS_TO_TICKS(cmd->delay_ms));
+        }
+    }
+
+    ESP_LOGI(TAG, "ST77916 initialized");
+
+    return ESP_OK;
+}
+ESP_RETURN_ON_ERROR(
+    lvgl_init(),
+    TAG,
+    "LVGL initialization failed");
+
+ESP_LOGI(TAG, "LVGL initialized");
+static esp_err_t lcd_draw_bitmap(
+    int x_start,
+    int y_start,
+    int x_end,
+    int y_end,
+    const void *color_data)
+{
+    uint8_t data[4];
+
+    /* Column address */
+    data[0] = (x_start >> 8) & 0xFF;
+    data[1] = x_start & 0xFF;
+    data[2] = ((x_end - 1) >> 8) & 0xFF;
+    data[3] = (x_end - 1) & 0xFF;
+
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_io_tx_param(
+            lcd_io,
+            CMD_CASET,
+            data,
+            4),
+        TAG,
+        "CASET failed");
+
+    /* Row address */
+    data[0] = (y_start >> 8) & 0xFF;
+    data[1] = y_start & 0xFF;
+    data[2] = ((y_end - 1) >> 8) & 0xFF;
+    data[3] = (y_end - 1) & 0xFF;
+
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_io_tx_param(
+            lcd_io,
+            CMD_RASET,
+            data,
+            4),
+        TAG,
+        "RASET failed");
+
+    size_t len =
+        (x_end - x_start) *
+        (y_end - y_start) *
+        sizeof(uint16_t);
+
+    ESP_RETURN_ON_ERROR(
+        esp_lcd_panel_io_tx_color(
+            lcd_io,
+            CMD_RAMWR,
+            color_data,
+            len),
+        TAG,
+        "RAMWR failed");
+
+    return ESP_OK;
+}
+void display_task(void)
+{
+    if (lvgl_display)
+    {
+        lv_timer_handler();
+    }
+}
+
+void display_set_backlight(uint8_t percent)
+{
+    if (percent)
+    {
+        gpio_set_level(LCD_PIN_BK_LIGHT, 1);
+    }
+    else
+    {
+        gpio_set_level(LCD_PIN_BK_LIGHT, 0);
+    }
+}
+
+void display_clear(uint16_t color)
+{
+    static uint16_t line[LCD_H_RES];
+
+    for (int i = 0; i < LCD_H_RES; i++)
+    {
+        line[i] = color;
+    }
+
+    for (int y = 0; y < LCD_V_RES; y++)
+    {
+        lcd_draw_bitmap(
+            0,
+            y,
+            LCD_H_RES,
+            y + 1,
+            line);
+    }
+}
+static void lvgl_flush_cb(lv_display_t *display,
+                          const lv_area_t *area,
+                          uint8_t *px_map)
+{
+    lcd_draw_bitmap(
+        area->x1,
+        area->y1,
+        area->x2 + 1,
+        area->y2 + 1,
+        px_map);
+
+    lv_display_flush_ready(display);
+}
+static esp_err_t lvgl_init(void)
+{
+    lv_init();
+
+    size_t buffer_size =
+        LCD_H_RES *
+        LVGL_BUFFER_LINES *
+        sizeof(lv_color_t);
+
+    buf1 = heap_caps_malloc(
+        buffer_size,
+        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+
+    buf2 = heap_caps_malloc(
+        buffer_size,
+        MALLOC_CAP_DMA | MALLOC_CAP_INTERNAL);
+
+    ESP_RETURN_ON_FALSE(
+        buf1 && buf2,
+        ESP_ERR_NO_MEM,
+        TAG,
+        "Unable to allocate LVGL buffers");
+
+    lvgl_display = lv_display_create(
+        LCD_H_RES,
+        LCD_V_RES);
+
+    lv_display_set_buffers(
+        lvgl_display,
+        buf1,
+        buf2,
+        buffer_size,
+        LV_DISPLAY_RENDER_MODE_PARTIAL);
+
+    lv_display_set_flush_cb(
+        lvgl_display,
+        lvgl_flush_cb);
+
+    return ESP_OK;
+}
+/*----------------------------------------------------------
+ * LVGL Tick
+ *---------------------------------------------------------*/
+
+static void lvgl_tick_cb(void *arg)
+{
+    (void)arg;
+    lv_tick_inc(LVGL_TICK_PERIOD_MS);
+}
+
+static esp_timer_handle_t lvgl_tick_timer = NULL;
+
+static esp_err_t lvgl_tick_init(void)
+{
+    const esp_timer_create_args_t timer_args =
+    {
+        .callback = lvgl_tick_cb,
+        .name = "lvgl_tick",
+    };
+
+    ESP_RETURN_ON_ERROR(
+        esp_timer_create(
+            &timer_args,
+            &lvgl_tick_timer),
+        TAG,
+        "Unable to create LVGL timer");
+
+    ESP_RETURN_ON_ERROR(
+        esp_timer_start_periodic(
+            lvgl_tick_timer,
+            LVGL_TICK_PERIOD_MS * 1000),
+        TAG,
+        "Unable to start LVGL timer");
+
+    return ESP_OK;
+}
+static void create_test_screen(void)
+{
+    lv_obj_t *scr = lv_screen_active();
+
+    lv_obj_set_style_bg_color(
+        scr,
+        lv_color_hex(0x000000),
+        LV_PART_MAIN);
+
+    lv_obj_t *label = lv_label_create(scr);
+
+    lv_label_set_text(
+        label,
+        "Digital Dash");
+
+    lv_obj_center(label);
+}
+create_test_screen();
